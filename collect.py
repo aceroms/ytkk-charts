@@ -57,6 +57,32 @@ CANDS_JS = r"""() => {
     return cs.overflow.includes('hidden') && el.offsetHeight <= 1;  // 접힌 가사 · 화면 읽기 전용 글자
   };
   const cls = (el) => (typeof el.className === 'string' ? el.className.trim().replace(/\s+/g, ' ') : '');
+  // '..'로 잘려 보이는 글자: 줄 안의 속성(title 등)이나 숨은 글자에서 같은 말로 시작하는 더 긴 글자를 찾는다
+  const CUT = /(\.\.|…)$/;
+  const norm = (v) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim() : '');
+  const full = (el, row, t) => {
+    const pre = t.replace(/(\.+|…)$/, '').trim();
+    if (pre.length < 2) return null;
+    const ok = (v) => { v = norm(v); return v.startsWith(pre) && v.length > pre.length + 1 && !CUT.test(v) ? v : null; };
+    for (let e = el; e && e !== row.parentElement; e = e.parentElement) {
+      for (const a of ['title', 'data-title', 'data-original-title', 'aria-label', 'alt']) {
+        const v = ok(e.getAttribute(a));
+        if (v) return v;
+      }
+    }
+    for (const e of [row, ...row.querySelectorAll('*')]) {
+      for (const a of e.getAttributeNames()) {
+        let v = e.getAttribute(a);
+        try { v = decodeURIComponent(v); } catch (x) { /* 그대로 */ }
+        if (ok(v)) return ok(v);
+      }
+    }
+    const tw = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+      if (ok(n.textContent)) return ok(n.textContent);
+    }
+    return null;
+  };
   const tokens = (row) => {
     const out = [];
     const walk = (n, hint) => {
@@ -64,7 +90,9 @@ CANDS_JS = r"""() => {
         if (out.length >= 80) return;
         if (c.nodeType === 3) {
           const t = c.textContent.replace(/\s+/g, ' ').trim();
-          if (t) out.push([t.slice(0, 200), hint]);
+          const f = t && CUT.test(t) ? full(n, row, t) : null;
+          if (f) out.push([f.slice(0, 200), hint + '>@full']);  // @full: 전체 제목을 찾음 (세기용 표시)
+          else if (t) out.push([t.slice(0, 200), hint]);
         } else if (c.nodeType === 1 && !SKIP.test(c.tagName) && !hidden(c)) {
           walk(c, hint + '>' + cls(c));
         }
@@ -111,10 +139,30 @@ TITLE_HINT = re.compile(r'(^|[\s_>-])(tit|title|subject)', re.I)  # class 이름
 ARTIST_HINT = re.compile(r'(^|[\s_>-])(sng|singer|artist|art)([\s_>-]|$)', re.I)  # …_sng, singer, mo-art …
 
 
-def parse_rows(rows):
+CUT_TAIL = re.compile(r'(?<!\.)\.\.$')  # 사이트가 긴 제목 끝을 잘라 붙인 '..' (세 점 '...'은 원래 제목일 수 있어 그대로)
+
+
+def fix_cut(title):
+    """전체 제목을 못 찾은 '..' 제목: '..'을 떼고, 닫히지 않은 괄호부터 뒤를 버린다.
+    예) 'Tears (ドラマ..' → 'Tears', 'うさぎラップ(…ver.) ("ちいかわ..' → 'うさぎラップ(…ver.)'"""
+    t = CUT_TAIL.sub('', title).rstrip()
+    pairs, opened = {')': '(', '）': '（', ']': '[', '」': '「', '』': '『'}, []
+    for k, ch in enumerate(t):
+        if ch in pairs.values():
+            opened.append((ch, k))
+        elif ch in pairs and opened and opened[-1][0] == pairs[ch]:
+            opened.pop()
+    if opened:
+        t = t[:opened[0][1]]
+    t = t.rstrip(' -,/:·~"\'')
+    return t or CUT_TAIL.sub('', title).rstrip()
+
+
+def parse_rows(rows, stats=None):
     """줄들 [[글자, class 이름들], ...] → [[번호, 제목, 가수], ...].
     곡 번호: 100보다 큰 3~6자리 숫자 중 첫째 (앞의 순위·등락 숫자는 100 이하).
-    제목·가수: class 이름(tit·title / sng·singer·artist)으로 먼저 고르고, 없으면 번호 다음 글자 순서대로."""
+    제목·가수: class 이름(tit·title / sng·singer·artist)으로 먼저 고르고, 없으면 번호 다음 글자 순서대로.
+    stats를 주면 잘린 제목 수를 센다 (full: 전체 제목 찾음, cut: 뒷부분 정리)."""
     out, seen = [], set()
     for toks in rows:
         toks = [(t, h) for t, h in toks if t not in JUNK]
@@ -135,6 +183,12 @@ def parse_rows(rows):
         if n in seen:
             continue
         seen.add(n)
+        if stats is not None and len(out) < 100 and any(t == title and '@full' in h for t, h in rest):
+            stats['full'] += 1
+        if CUT_TAIL.search(title):
+            title = fix_cut(title)
+            if stats is not None and len(out) < 100:
+                stats['cut'] += 1
         out.append([n, title, artist])
     return out[:100]
 
@@ -233,12 +287,17 @@ def read_page(page, caught, log):
             got, via = j, 'JSON ' + r.url.split('?')[0][-60:]
     if len(got) >= 10:
         return got, via
-    best, scored = [], []
+    best, scored, win = [], [], None
     for c in page.evaluate(CANDS_JS):
         p = parse_rows(c['rows'])
         scored.append((len(p), c))
         if len(p) > len(best):
-            best, via = p, '화면 ' + c['where'][-80:]
+            best, via, win = p, '화면 ' + c['where'][-80:], c
+    if win:
+        stats = {'full': 0, 'cut': 0}
+        parse_rows(win['rows'], stats)
+        if stats['full'] or stats['cut']:
+            via += ' · 잘린 제목: 전체 찾음 %d, 뒤 정리 %d' % (stats['full'], stats['cut'])
     scored.sort(key=lambda x: (-x[0], -len(x[1]['rows'])))
     log.append('  화면 줄 묶음 후보 %d개 (곡이 많이 읽힌 순, 앞 8개)' % len(scored))
     for k, (n, c) in enumerate(scored[:8], 1):
