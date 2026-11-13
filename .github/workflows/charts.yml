@@ -23,14 +23,16 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: TJ·금영 인기곡 모으기
         run: python collect.py
-      - name: 바뀌었으면 올리기
+      - name: 바뀌었으면 올리기 (charts.json · debug 폴더)
+        if: ${{ !cancelled() }} # 모으기가 실패해도 debug 폴더(실패한 화면 모양)는 올린다
         run: |
-          if git diff --quiet -- charts.json; then
+          git add charts.json
+          git add -A debug 2>/dev/null || true # debug 폴더가 없으면(전에도 없었으면) 건너뜀
+          if git diff --cached --quiet; then
             echo "바뀐 것이 없어요"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add charts.json
           git commit -m "인기곡 목록 $(TZ=Asia/Seoul date +%Y-%m-%d)"
           git push
