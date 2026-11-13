@@ -4,18 +4,22 @@
 - 매달 GitHub Actions에서 실행된다 (.github/workflows/charts.yml). PC에서 직접 실행해도 된다.
 - 목록마다 따로 가져오고, 못 가져온 목록은 지난 charts.json 내용을 그대로 둔다.
 - 하나도 못 가져오면 오류로 끝난다 → Actions에 빨간 표시가 뜨고 charts.json은 그대로.
+- 못 가져온 목록은 그 화면 모양을 debug 폴더에 남긴다 (목록.txt 요약 · 목록.html · 목록.jpg).
+  실행할 때마다 debug 폴더를 비우고 새로 쓰므로, 다 성공하면 debug 폴더는 없어진다.
 - 사이트 화면이 바뀌면 아래 SOURCES(주소·누를 탭 이름)나 줄 읽는 방법을 고쳐야 한다.
 """
 import datetime
 import json
 import pathlib
 import re
+import shutil
 import sys
 
 from playwright.sync_api import sync_playwright
 
 ROOT = pathlib.Path(__file__).resolve().parent
 OUT = ROOT / 'charts.json'
+DEBUG = ROOT / 'debug'
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 # TV 노래모음에 보일 모양. rows(곡 목록)는 가져와서 채운다
@@ -40,51 +44,94 @@ SOURCES = [
 ]
 MIN_ROWS = {'ky100': 60, 'tj100': 60}  # 이보다 적게 읽히면 실패로 본다 (나머지는 20곡)
 ORDER = ['ky100', 'tj100', 'kyjp', 'tjjp', 'kyballad', 'kytrot', 'kydance']  # 지난 파일에만 있는 목록은 뒤에 그대로
+SEARCH = {'tjjp'}  # 탭을 눌러도 목록이 안 바뀌면 '검색'·'조회' 단추도 눌러 보는 곳
 
-# 화면의 줄(tr·li 등)마다 보이는 글자 조각을 순서대로 모은다
-ROWS_JS = r"""() => {
-  const out = [];
-  const els = document.querySelectorAll('tr, li, [role=row]');
-  for (const el of els) {
-    if (el.querySelector('tr, li, [role=row]')) continue;
-    const toks = [];
-    const walk = (n) => {
+# 화면에서 '곡 줄' 후보를 모은다. 줄마다 [보이는 글자, 그 글자를 감싼 class 이름들]을 순서대로.
+# 1) 맨 안쪽 tr·li (표·목록)  2) 같은 모양의 자식이 8개 넘게 반복되는 곳 (div·ul 줄 등 표가 아닌 목록)
+CANDS_JS = r"""() => {
+  const SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|BUTTON|SELECT|OPTION|BR|IMG|SVG|INPUT|TEXTAREA)$/i;
+  const hidden = (el) => {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'contents') return false;
+    if (cs.display === 'none' || cs.visibility === 'hidden' || el.getClientRects().length === 0) return true;
+    return cs.overflow.includes('hidden') && el.offsetHeight <= 1;  // 접힌 가사 · 화면 읽기 전용 글자
+  };
+  const cls = (el) => (typeof el.className === 'string' ? el.className.trim().replace(/\s+/g, ' ') : '');
+  const tokens = (row) => {
+    const out = [];
+    const walk = (n, hint) => {
       for (const c of n.childNodes) {
-        if (c.nodeType === 3) { const t = c.textContent.replace(/\s+/g, ' ').trim(); if (t) toks.push(t); }
-        else if (c.nodeType === 1 && !/^(SCRIPT|STYLE|BUTTON|SELECT|OPTION)$/.test(c.tagName)) {
-          const cs = getComputedStyle(c);
-          if (cs.display !== 'none' && cs.visibility !== 'hidden') walk(c);
+        if (out.length >= 80) return;
+        if (c.nodeType === 3) {
+          const t = c.textContent.replace(/\s+/g, ' ').trim();
+          if (t) out.push([t.slice(0, 200), hint]);
+        } else if (c.nodeType === 1 && !SKIP.test(c.tagName) && !hidden(c)) {
+          walk(c, hint + '>' + cls(c));
         }
       }
     };
-    walk(el);
-    if (toks.length >= 3 && toks.length <= 40) out.push(toks);
+    walk(row, '');
+    return out;
+  };
+  const path = (el) => {
+    const p = [];
+    for (let e = el; e && e !== document.body && p.length < 4; e = e.parentElement) {
+      const c = cls(e).split(' ').filter(Boolean).slice(0, 2).join('.');
+      p.unshift(e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') + (c ? '.' + c : ''));
+    }
+    return p.join(' > ');
+  };
+  const cands = [];
+  const leaf = [...document.querySelectorAll('tr, li, [role=row]')]
+    .filter(el => !el.querySelector('tr, li, [role=row]') && !hidden(el))
+    .slice(0, 400).map(tokens).filter(t => t.length >= 2);
+  if (leaf.length) cands.push({where: '맨 안쪽 tr·li', rows: leaf});
+  const STATE = /^(on|active|selected|current|first|last|odd|even|clear|clearfix)$/i;
+  for (const el of document.querySelectorAll('body *')) {
+    const kids = [...el.children].filter(k => !SKIP.test(k.tagName));
+    if (kids.length < 8) continue;
+    const groups = new Map();
+    for (const k of kids) {
+      const sig = k.tagName.toLowerCase() + cls(k).split(' ').filter(c => c && !STATE.test(c)).sort().map(c => '.' + c).join('');
+      if (!groups.has(sig)) groups.set(sig, []);
+      groups.get(sig).push(k);
+    }
+    const [sig, g] = [...groups].sort((a, b) => b[1].length - a[1].length)[0];
+    if (g.length < 8) continue;
+    const rows = g.filter(k => !hidden(k)).slice(0, 210).map(tokens).filter(t => t.length >= 2);
+    if (rows.length >= 5) cands.push({where: path(el) + ' > ' + sig + ' ×' + g.length, rows});
   }
-  return out;
+  return cands;
 }"""
 
 NUM = re.compile(r'^\d{1,6}$')
 DATE = re.compile(r'^\d{4}[.\-/]\d{1,2}([.\-/]\d{1,2})?$')
+JUNK = {'닫기', '가사', '가사보기', 'MV', 'MR', 'NEW', 'HOT', 'LTS', 'PICK', '+'}  # 제목·가수 옆의 표시·단추 글자
+TITLE_HINT = re.compile(r'(^|[\s_>-])(tit|title|subject)', re.I)  # class 이름: popular_chart_tit, song-title …
+ARTIST_HINT = re.compile(r'(^|[\s_>-])(sng|singer|artist|art)([\s_>-]|$)', re.I)  # …_sng, singer, mo-art …
 
 
 def parse_rows(rows):
-    """[글자 조각, ...] 줄들 → [[번호, 제목, 가수], ...]. 순위(앞의 작은 숫자) 다음의 3~6자리가 곡 번호."""
+    """줄들 [[글자, class 이름들], ...] → [[번호, 제목, 가수], ...].
+    곡 번호: 100보다 큰 3~6자리 숫자 중 첫째 (앞의 순위·등락 숫자는 100 이하).
+    제목·가수: class 이름(tit·title / sng·singer·artist)으로 먼저 고르고, 없으면 번호 다음 글자 순서대로."""
     out, seen = [], set()
     for toks in rows:
-        nums = [i for i, t in enumerate(toks) if NUM.match(t)]
-        if not nums:
+        toks = [(t, h) for t, h in toks if t not in JUNK]
+        i = next((k for k, (t, _) in enumerate(toks) if NUM.match(t) and len(t) >= 3 and int(t) > 100), None)
+        if i is None:
             continue
-        i = nums[0]
-        if len(nums) > 1 and int(toks[nums[0]]) <= 100 and len(toks[nums[1]]) >= 3 and nums[1] <= nums[0] + 2:
-            i = nums[1]  # 첫 숫자는 순위
-        if len(toks[i]) < 3:
+        rest = [(t, h) for t, h in toks[i + 1:] if not DATE.match(t) and len(t) <= 120]
+        title = next((t for t, h in rest if TITLE_HINT.search(h) and not ARTIST_HINT.search(h)), None)
+        if title is None:
+            title = next((t for t, _ in rest if not NUM.match(t)), None)
+        if not title:
             continue
-        rest = [t for t in toks[i + 1:] if not NUM.match(t) and not DATE.match(t) and len(t) <= 120]
-        if not rest:
-            continue
-        title = rest[0]
-        artist = next((t for t in rest[1:] if t != title and len(t) <= 60), '')
-        n = int(toks[i])
+        artist = next((t for t, h in rest if ARTIST_HINT.search(h) and t != title and len(t) <= 60), None)
+        if artist is None:
+            after = [t for t, _ in rest][[t for t, _ in rest].index(title) + 1:]
+            artist = next((t for t in after if t != title and len(t) <= 60 and not NUM.match(t)), '')
+        n = int(toks[i][0])
         if n in seen:
             continue
         seen.add(n)
@@ -127,10 +174,11 @@ def parse_json(obj):
     return best[:100]
 
 
-def click_tab(page, names):
+def click_tab(page, names, log):
     for name in names:
         loc = page.get_by_text(name, exact=True)
         if loc.count():
+            log.append('탭 누름: %s (같은 글자 %d개 중 첫째) %s' % (name, loc.count(), loc.first.evaluate('e => e.outerHTML.slice(0, 200)')))
             loc.first.click(timeout=8000)
             page.wait_for_load_state('networkidle', timeout=20000)
             page.wait_for_timeout(1500)
@@ -138,52 +186,137 @@ def click_tab(page, names):
     raise RuntimeError('탭을 못 찾음: ' + ', '.join(names))
 
 
-def collect(page, lid, urls, tabs):
-    rows = []
+def click_search(page, log):
+    """탭만 눌러서는 목록이 안 바뀌는 곳을 위해 '검색'·'조회' 단추를 누른다. 머리글(header·nav)의 검색은 건너뛴다."""
+    for name in ('검색', '조회'):
+        loc = page.get_by_role('button', name=name, exact=True).or_(page.get_by_text(name, exact=True))
+        for k in range(min(loc.count(), 10)):
+            el = loc.nth(k)
+            if el.is_visible() and not el.evaluate("e => !!e.closest('header, nav, #header, .header, .gnb')"):
+                log.append('단추 누름: %s %s' % (name, el.evaluate('e => e.outerHTML.slice(0, 200)')))
+                el.click(timeout=8000)
+                page.wait_for_load_state('networkidle', timeout=20000)
+                page.wait_for_timeout(1500)
+                return True
+    log.append('누를 검색·조회 단추가 없어요')
+    return False
+
+
+def same_as(rows, others):
+    """앞 20곡 번호가 이번에 모은 다른 목록과 똑같으면 그 목록 이름 (탭이 안 바뀐 것)"""
+    head = [x[0] for x in rows[:20]]
+    return next((k for k, v in others.items() if len(head) >= 10 and [x[0] for x in v[:20]] == head), None)
+
+
+def read_page(page, caught, log):
+    """먼저 사이트가 받아 온 JSON에서, 없으면 화면 글자에서 곡 줄을 읽는다 → (곡 줄, 읽은 곳)"""
+    got, via = [], ''
+    for r in caught:
+        if r.request.resource_type not in ('xhr', 'fetch') and 'json' not in (r.headers.get('content-type') or ''):
+            continue
+        try:
+            body = r.text()
+        except Exception as e:
+            log.append('  응답 %s %s → 내용을 못 읽음 (%s)' % (r.request.method, r.url[:150], str(e).splitlines()[0][:80]))
+            continue
+        j = []
+        if body.lstrip()[:1] in ('{', '['):  # content-type이 json이 아니어도 JSON이면 읽는다
+            try:
+                j = parse_json(json.loads(body))
+            except Exception:
+                pass
+        log.append('  응답 %s %s [%s, %s, %d자] → 곡 %d줄' % (r.request.method, r.url[:150], r.status, r.headers.get('content-type', ''), len(body), len(j)))
+        if r.request.post_data:
+            log.append('    보낸 값: ' + r.request.post_data[:300])
+        log.append('    앞부분: ' + re.sub(r'\s+', ' ', body[:300]))
+        if len(j) > len(got):
+            got, via = j, 'JSON ' + r.url.split('?')[0][-60:]
+    if len(got) >= 10:
+        return got, via
+    best, scored = [], []
+    for c in page.evaluate(CANDS_JS):
+        p = parse_rows(c['rows'])
+        scored.append((len(p), c))
+        if len(p) > len(best):
+            best, via = p, '화면 ' + c['where'][-80:]
+    scored.sort(key=lambda x: (-x[0], -len(x[1]['rows'])))
+    log.append('  화면 줄 묶음 후보 %d개 (곡이 많이 읽힌 순, 앞 8개)' % len(scored))
+    for k, (n, c) in enumerate(scored[:8], 1):
+        log.append('  [%d] %s · %d줄 → 곡 %d줄' % (k, c['where'], len(c['rows']), n))
+        for row in c['rows'][:3]:
+            log.append('      | ' + ' | '.join(t[:40] + ('{%s}' % h.strip('>')[-40:] if h.strip('>') else '') for t, h in row[:14]))
+    return best, via
+
+
+def collect(page, lid, urls, tabs, others, log):
+    rows, vias = [], []
+    need = MIN_ROWS.get(lid, 20)
     for url in urls:
         caught = []
-        handler = lambda r: caught.append(r)
+        handler = lambda r, c=caught: c.append(r)  # Playwright는 내장 함수(caught.append)를 바로 못 받는다
         page.on('response', handler)
         try:
+            log.append('== 주소: ' + url)
             page.goto(url, wait_until='networkidle', timeout=45000)
             page.wait_for_timeout(1500)
             if tabs:
                 caught.clear()
-                click_tab(page, tabs)
+                click_tab(page, tabs, log)
+            log.append('지금 주소: %s · 제목: %s' % (page.url, page.title()))
+            got, via = read_page(page, caught, log)
+            if lid in SEARCH and (len(got) < need or same_as(got, others)):
+                log.append('목록이 안 바뀐 것 같아 검색 단추를 눌러 봐요 (%d곡, 같은 목록: %s)' % (len(got), same_as(got, others)))
+                caught.clear()
+                if click_search(page, log):
+                    got, via = read_page(page, caught, log)
         finally:
             page.remove_listener('response', handler)
-        got = []
-        for r in caught:  # 먼저 사이트가 받아 온 JSON에서
-            try:
-                if 'json' in (r.headers.get('content-type') or ''):
-                    j = parse_json(r.json())
-                    if len(j) > len(got):
-                        got = j
-            except Exception:
-                pass
-        if len(got) < 10:  # 없으면 화면 글자에서
-            got = parse_rows(page.evaluate(ROWS_JS))
         rows += [x for x in got if x[0] not in {y[0] for y in rows}]
-    need = MIN_ROWS.get(lid, 20)
+        vias.append(via)
     if len(rows) < need:
         raise RuntimeError('%d곡만 읽혔어요 (최소 %d곡)' % (len(rows), need))
-    return rows[:100]
+    same = same_as(rows, others)
+    if same:
+        raise RuntimeError('%s 목록과 똑같아요 — 탭이 안 바뀐 것 같아요' % same)
+    return rows[:100], ' / '.join(dict.fromkeys(v for v in vias if v))
+
+
+def save_debug(page, lid, err, log):
+    """못 가져온 목록의 화면 모양을 debug 폴더에 남긴다 (요약 txt · html · 화면 jpg)"""
+    DEBUG.mkdir(exist_ok=True)
+    head = ['목록: ' + lid, '이유: ' + str(err).splitlines()[0][:300],
+            '시각: ' + datetime.datetime.now(KST).strftime('%Y-%m-%d %H:%M KST'), '']
+    (DEBUG / (lid + '.txt')).write_text('\n'.join(head + log) + '\n', encoding='utf-8')
+    for name, save in ((lid + '.html', lambda p: p.write_text(page.content(), encoding='utf-8')),
+                       (lid + '.jpg', lambda p: page.screenshot(path=str(p), full_page=True, type='jpeg', quality=50))):
+        try:
+            save(DEBUG / name)
+        except Exception as e:
+            with (DEBUG / (lid + '.txt')).open('a', encoding='utf-8') as f:
+                f.write('%s 저장 실패: %s\n' % (name, str(e).splitlines()[0][:150]))
 
 
 def main():
     old = json.loads(OUT.read_text(encoding='utf-8')) if OUT.exists() else {'lists': []}
     old_lists = {l['id']: l for l in old.get('lists', [])}
     new_rows, report = {}, []
+    shutil.rmtree(DEBUG, ignore_errors=True)  # 지난번 실패 기록은 지우고 이번 것만 남긴다
     with sync_playwright() as pw:
         br = pw.chromium.launch()
         page = br.new_context(locale='ko-KR', timezone_id='Asia/Seoul', viewport={'width': 1366, 'height': 900},
                               user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36').new_page()
         for lid, urls, tabs in SOURCES:
+            log = []
             try:
-                new_rows[lid] = collect(page, lid, urls, tabs)
-                report.append('%-9s 성공 %3d곡  1위 %s' % (lid, len(new_rows[lid]), new_rows[lid][0][1]))
+                new_rows[lid], via = collect(page, lid, urls, tabs, new_rows, log)
+                report.append('%-9s 성공 %3d곡  1위 %s  (%s)' % (lid, len(new_rows[lid]), new_rows[lid][0][1], via))
             except Exception as e:
                 report.append('%-9s 실패 — %s (지난 목록 그대로)' % (lid, str(e).splitlines()[0][:150]))
+                try:
+                    save_debug(page, lid, e, log)
+                    report.append('          화면 모양 저장: debug/%s.txt · .html · .jpg' % lid)
+                except Exception as e2:
+                    report.append('          화면 모양 저장 실패: %s' % str(e2).splitlines()[0][:150])
         br.close()
     print('\n'.join(report))
     if not new_rows:
