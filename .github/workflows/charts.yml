@@ -1,0 +1,36 @@
+name: 인기곡 모으기
+
+on:
+  schedule:
+    - cron: '17 1 4 * *' # 매달 4일 오전 10시 17분 (한국 시간)
+  workflow_dispatch: # Actions 화면에서 'Run workflow'로 바로 실행
+
+permissions:
+  contents: write # 바뀐 charts.json을 올리기 위해
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: 준비 (Playwright · Chromium)
+        run: |
+          pip install 'playwright>=1.50'
+          python -m playwright install --with-deps chromium
+      - name: TJ·금영 인기곡 모으기
+        run: python collect.py
+      - name: 바뀌었으면 올리기
+        run: |
+          if git diff --quiet -- charts.json; then
+            echo "바뀐 것이 없어요"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add charts.json
+          git commit -m "인기곡 목록 $(TZ=Asia/Seoul date +%Y-%m-%d)"
+          git push
