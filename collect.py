@@ -11,6 +11,7 @@
 """
 import datetime
 import gzip
+import html
 import json
 import pathlib
 import re
@@ -483,6 +484,33 @@ def song_of(rows, n):
     return None
 
 
+# TJ 검색 결과 줄 (2026-11 화면): <ul class="grid-container list"> 안에 .num2 곡 번호 · .title3 제목 · .singer 가수
+# (결과가 한 곡뿐이면 '같은 모양이 8개 넘게 반복되는 곳'으로 못 찾아서 따로 읽는다)
+TJ_ROWS_JS = r"""() => Array.from(document.querySelectorAll('ul.grid-container.list')).map((u) => {
+  const t = (sel) => { const e = u.querySelector(sel); return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+  return [t('.num2') || t('.count'), t('.title3 .flex-box > p') || t('.title3'), t('.singer')];
+})"""
+TJ_ROW = re.compile(r'<ul class="grid-container list[^"]*">(.*?)</ul>\s*</li>', re.S)
+
+
+def tj_html_rows(body):
+    """TJ 검색 결과 화면 글(HTML) → [[번호, 제목, 가수], ...] (화면을 열지 않고 읽기)"""
+    out = []
+    for block in TJ_ROW.findall(body or ''):
+        num = re.search(r'class="num2">(.*?)</p>', block, re.S) or re.search(r'class="count">(.*?)</p>', block, re.S)
+        title = re.search(r'class="grid-item title3">(.*?)</li>\s*<li class="grid-item title4', block, re.S)
+        singer = re.search(r'class="grid-item title4 singer">(.*?)</li>', block, re.S)
+        n = re.sub(r'\D', '', TAG.sub('', num.group(1))) if num else ''
+        t = ''
+        if title:
+            ps = re.findall(r'<p[^>]*>(.*?)</p>', title.group(1), re.S)
+            t = html.unescape(clean_text(ps[-1])) if ps else ''
+        a = html.unescape(clean_text(singer.group(1))) if singer else ''
+        if n and t:
+            out.append([int(n), t, a])
+    return out
+
+
 # 화면 안에서 요청 보내기 → [상태, 본문] (20초 넘으면 0)
 FETCH_JS = r"""async ([u, m, h, d]) => {
   const ctl = new AbortController();
@@ -555,6 +583,9 @@ class TjNumber:
         self.page.wait_for_timeout(800)
 
     def rows_on_page(self):
+        tj = [[int(re.sub(r'\D', '', n)), t, a] for n, t, a in self.page.evaluate(TJ_ROWS_JS) if re.sub(r'\D', '', n) and t]
+        if tj:
+            return tj
         best = []
         for c in self.page.evaluate(CANDS_JS):
             p = parse_rows(c['rows'])
@@ -598,12 +629,15 @@ class TjNumber:
                 self.req = {'url': r.url, 'method': r.request.method, 'data': r.request.post_data, 'probe': n,
                             'headers': {k: v for k, v in r.request.headers.items() if k.lower() in ('content-type', 'accept') or k.lower().startswith('x-')}}
                 break
-        if not self.mode and re.search(r'(?<!\d)%d(?!\d)' % n, page.url):
-            self.mode, self.req = 'nav', {'url': page.url, 'probe': n}
-        if not self.mode and song_of(self.rows_on_page(), n):
-            self.mode = 'ui'
         if not self.mode:
-            raise RuntimeError('아는 번호 %d를 찾아도 결과를 못 읽었어요' % n)
+            shown = song_of(self.rows_on_page(), n)
+            self.log.append('결과 화면에서 읽은 곡: %s' % (shown,))
+            if not shown:
+                raise RuntimeError('아는 번호 %d를 찾아도 결과를 못 읽었어요' % n)
+            # 결과 화면 주소에 번호가 들어 있으면 주소만 바꿔 연다 (TJ: …/accompaniment_search?strType=16&searchTxt=번호)
+            self.mode = 'nav' if re.search(r'(?<!\d)%d(?!\d)' % n, page.url) else 'ui'
+            if self.mode == 'nav':
+                self.req = {'url': page.url, 'probe': n}
         self.log.append('찾는 방법: ' + self.mode)
         # 다른 아는 번호로 한 번 더 확인 (번호만 바꿔 보낸 요청이 맞게 되는지)
         for m in probes[1:]:
@@ -634,7 +668,14 @@ class TjNumber:
                 raise RuntimeError('응답 %s' % status)
             return song_of(self.json_rows(body), n)
         if self.mode == 'nav':
-            page.goto(self.swap(self.req['url'], n), wait_until='networkidle', timeout=30000)
+            url = self.swap(self.req['url'], n)
+            # 먼저 화면을 열지 않고 결과 글만 받아 읽는다 (빠름). 못 읽으면 화면을 열어서
+            status, body = page.evaluate(FETCH_JS, [url, 'GET', {}, None])
+            if status == 200:
+                rows = tj_html_rows(body)
+                if rows or '검색 결과가 없' in body or 'grid-container' in body:
+                    return song_of(rows, n)
+            page.goto(url, wait_until='networkidle', timeout=30000)
             return song_of(self.rows_on_page(), n)
         caught = []
         handler = lambda r, c=caught: c.append(r)
