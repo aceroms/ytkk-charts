@@ -11,7 +11,7 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60 # 빠진 번호 찾기가 35분까지 걸릴 수 있어요
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -23,10 +23,15 @@ jobs:
           python -m playwright install --with-deps chromium
       - name: TJ·금영 인기곡 모으기
         run: python collect.py
-      - name: 바뀌었으면 올리기 (charts.json · debug 폴더)
+      - name: TJ 빠진 번호 모으기 (extra.json)
+        if: ${{ !cancelled() }} # 인기곡 모으기가 실패해도 한다
+        continue-on-error: true # 이게 실패해도 인기곡은 올린다
+        run: python collect.py --extra
+      - name: 바뀌었으면 올리기 (charts.json · extra.json · debug 폴더)
         if: ${{ !cancelled() }} # 모으기가 실패해도 debug 폴더(실패한 화면 모양)는 올린다
         run: |
           git add charts.json
+          git add extra.json 2>/dev/null || true # 아직 없으면 건너뜀
           git add -A debug 2>/dev/null || true # debug 폴더가 없으면(전에도 없었으면) 건너뜀
           if git diff --cached --quiet; then
             echo "바뀐 것이 없어요"
