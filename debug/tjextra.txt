@@ -1,0 +1,11 @@
+목록: tjextra
+이유: 두 번째 아는 번호 27121를 못 찾았어요
+시각: 2026-11-16 19:39 KST
+
+곡 목록 2026-11-14 · TJ 번호 67741개
+검색 종류: select에서 곡 번호
+찾아 본 번호 26730 → 지금 주소 https://www.tjmedia.com/song/accompaniment_search?nationType=&strType=16&searchTxt=26730
+찾는 방법: nav
+확인 27121 → None
+다시 보내기(nav)가 안 돼서 매번 입력하는 방법으로 바꿔요
+검색 종류: select에서 곡 번호
